@@ -102,7 +102,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Приложение откроется на **http://localhost:5050**
+Приложение откроется на **http://localhost:443**
 
 ### Структура проекта
 ```
