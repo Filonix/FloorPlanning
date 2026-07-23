@@ -98,4 +98,4 @@ def safe_id(pid: str) -> str:
 if __name__ == "__main__":
     # Fixed port (gateway forwards via ?XTransformPort=5050)
     # use_reloader=False because we run as a background service
-    app.run(host="0.0.0.0", port=443, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)

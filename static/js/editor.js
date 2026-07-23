@@ -51,6 +51,8 @@ const S = {
   marquee: null,
   furniturePreview: null, // {item, x, y}
   viewMode: '2d',         // '2d' | '3d'
+  cam3d: { yaw: -Math.PI / 4, pitch: Math.PI / 6, dist: 1, cx: 0, cy: 0 },  // camera angles + zoom + pan
+  drag3d: null,
 
   // history
   history: [],
@@ -280,83 +282,278 @@ function drawSymbols() {
   }
 }
 
-/* ---------- 3D pseudo-isometric view ---------- */
+/* ---------- 3D view with rotatable camera ---------- */
+// World units = centimeters. X = east, Y = south (screen-down on 2D), Z = up.
+// Camera orbits around (cam3d.cx, cam3d.cy) at angles (yaw, pitch).
+function project3D(x, y, z) {
+  const cam = S.cam3d;
+  // center on camera target
+  const dx = x - cam.cx, dy = y - cam.cy, dz = z;
+  // yaw rotation around Z axis
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const x1 = dx * cy - dy * sy;
+  const y1 = dx * sy + dy * cy;
+  // pitch rotation around X axis (tilt down to see top)
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const y2 = y1 * cp - dz * sp;
+  const z2 = y1 * sp + dz * cp;
+  // orthographic-ish projection (no perspective for simplicity / correctness)
+  const sc = pxPerCm() * 0.5 * cam.dist;
+  const sx = S.W / 2 + x1 * sc;
+  const syy = S.H / 2 + y2 * sc - z2 * sc;
+  // depth for painter's algorithm (larger = further from camera)
+  return { x: sx, y: syy, depth: y2 };
+}
+
 function draw3D() {
   const c = S.ctx;
   c.clearRect(0, 0, S.W, S.H);
-  c.fillStyle = '#e8e4d8'; c.fillRect(0, 0, S.W, S.H);
-  // gradient sky
-  const grad = c.createLinearGradient(0, 0, 0, S.H * 0.5);
-  grad.addColorStop(0, '#cfe0ee'); grad.addColorStop(1, '#e8e4d8');
-  c.fillStyle = grad; c.fillRect(0, 0, S.W, S.H * 0.5);
+  // sky gradient
+  const grad = c.createLinearGradient(0, 0, 0, S.H);
+  grad.addColorStop(0, '#b8c8d8');
+  grad.addColorStop(0.55, '#dfe5e0');
+  grad.addColorStop(1, '#e8e0cc');
+  c.fillStyle = grad; c.fillRect(0, 0, S.W, S.H);
 
-  const sc = pxPerCm() * 0.6;
-  const wallH = (S.ceilingHeight || 270) * sc;
-  // isometric projection: x' = (x - y) * cos30, y' = (x + y) * sin30 - z
-  const cos30 = Math.cos(Math.PI / 6), sin30 = Math.sin(Math.PI / 6);
-  const proj = (x, y, z) => {
-    const px = S.W / 2 + ((x - S.pan.x) - (y - S.pan.y)) * sc * cos30;
-    const py = S.H / 2 + ((x - S.pan.x) + (y - S.pan.y)) * sc * sin30 - (z || 0) * sc;
-    return [px, py];
-  };
+  const wallH = S.ceilingHeight || 270;
 
-  // draw rooms (floor)
+  // Compute scene center if camera target not set meaningfully
+  if (!S._camInited && (S.walls.length || S.furniture.length || S.rooms.length)) {
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    const ex=(x,y)=>{minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);};
+    S.walls.forEach(w=>{ex(w.a.x,w.a.y);ex(w.b.x,w.b.y);});
+    S.furniture.forEach(f=>ex(f.x,f.y));
+    S.rooms.forEach(r=>r.points.forEach(p=>ex(p.x,p.y)));
+    if (isFinite(minX)) { S.cam3d.cx=(minX+maxX)/2; S.cam3d.cy=(minY+maxY)/2; S._camInited=true; }
+  }
+
+  // Build list of faces to draw (painter's algorithm: sort by depth desc)
+  const faces = [];
+
+  // FLOOR faces (rooms) — drawn FIRST (behind everything)
   if (S.layers.rooms) {
     for (const r of S.rooms) {
       if (r.points.length < 3) continue;
-      c.beginPath();
-      const [fx, fy] = proj(r.points[0].x, r.points[0].y, 0);
-      c.moveTo(fx, fy);
-      for (let i = 1; i < r.points.length; i++) { const [px, py] = proj(r.points[i].x, r.points[i].y, 0); c.lineTo(px, py); }
-      c.closePath();
-      c.fillStyle = r.color || 'rgba(245,158,11,0.25)'; c.fill();
-      c.strokeStyle = 'rgba(120,110,90,.4)'; c.lineWidth = 1; c.stroke();
+      const pts = r.points.map(p => project3D(p.x, p.y, 0));
+      const depth = pts.reduce((s,p)=>s+p.depth,0)/pts.length;
+      faces.push({ depth: depth + 1000000, draw() {
+        c.beginPath(); c.moveTo(pts[0].x, pts[0].y);
+        for (let i=1;i<pts.length;i++) c.lineTo(pts[i].x, pts[i].y);
+        c.closePath();
+        c.fillStyle = r.color ? solidifyColor(r.color, 0.55) : '#c9b896'; c.fill();
+        c.strokeStyle = 'rgba(90,80,60,.5)'; c.lineWidth = 1; c.stroke();
+      }});
     }
+  } else if (S.walls.length) {
+    // ground plane (bounding box) if no rooms
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    S.walls.forEach(w=>{minX=Math.min(minX,w.a.x,w.b.x);minY=Math.min(minY,w.a.y,w.b.y);maxX=Math.max(maxX,w.a.x,w.b.x);maxY=Math.max(maxY,w.a.y,w.b.y);});
+    const pts=[project3D(minX,minY,0),project3D(maxX,minY,0),project3D(maxX,maxY,0),project3D(minX,maxY,0)];
+    const depth=pts.reduce((s,p)=>s+p.depth,0)/4;
+    faces.push({depth:depth+1000000,draw(){c.beginPath();c.moveTo(pts[0].x,pts[0].y);for(let i=1;i<4;i++)c.lineTo(pts[i].x,pts[i].y);c.closePath();c.fillStyle='#c9b896';c.fill();}});
   }
-  // draw walls as 3D extruded boxes (front faces only, simple)
+
+  // WALL faces — each wall = 4 corner box. We draw both side faces + top.
   if (S.layers.walls) {
-    // sort walls by depth (further first): approx by (x+y)
-    const sorted = [...S.walls].sort((a, b) => ((a.a.x + a.a.y) + (a.b.x + b.b.y)) - ((b.a.x + b.a.y) + (b.b.x + b.b.y)));
-    for (const w of sorted) {
-      const t = (w.thickness || S.wallThickness) * sc * 0.5;
-      const [ax, ay] = proj(w.a.x, w.a.y, 0);
-      const [bx, by] = proj(w.b.x, w.b.y, 0);
-      const [axt, ayt] = proj(w.a.x, w.a.y, S.ceilingHeight);
-      const [bxt, byt] = proj(w.b.x, w.b.y, S.ceilingHeight);
-      // wall face (front)
-      c.fillStyle = '#d6cdb8';
-      c.beginPath(); c.moveTo(ax, ay); c.lineTo(bx, by); c.lineTo(bxt, byt); c.lineTo(axt, ayt); c.closePath(); c.fill();
-      c.strokeStyle = '#9a8f73'; c.lineWidth = 1; c.stroke();
-      // top edge
-      c.strokeStyle = '#7a6f55'; c.lineWidth = 1.2;
-      c.beginPath(); c.moveTo(axt, ayt); c.lineTo(bxt, byt); c.stroke();
-      // bottom
-      c.strokeStyle = '#9a8f73'; c.beginPath(); c.moveTo(ax, ay); c.lineTo(bx, by); c.stroke();
+    for (const w of S.walls) {
+      const t = (w.thickness || S.wallThickness);
+      // wall is a thin box from a to b, thickness t, height wallH
+      const ang = Math.atan2(w.b.y - w.a.y, w.b.x - w.a.x);
+      const nx = Math.cos(ang + Math.PI/2) * t / 2;
+      const ny = Math.sin(ang + Math.PI/2) * t / 2;
+      // 4 base corners (bottom) + 4 top corners
+      const corners = [
+        { x: w.a.x + nx, y: w.a.y + ny },
+        { x: w.b.x + nx, y: w.b.y + ny },
+        { x: w.b.x - nx, y: w.b.y - ny },
+        { x: w.a.x - nx, y: w.a.y - ny },
+      ];
+      const btm = corners.map(p => project3D(p.x, p.y, 0));
+      const top = corners.map(p => project3D(p.x, p.y, wallH));
+      // 4 side faces
+      for (let i=0;i<4;i++) {
+        const j=(i+1)%4;
+        const pts=[btm[i],btm[j],top[j],top[i]];
+        const depth=(btm[i].depth+btm[j].depth+top[j].depth+top[i].depth)/4;
+        // shading: faces facing camera brighter
+        const shade = 0.7 + 0.3 * Math.max(0, Math.cos(ang + Math.PI/2 * (i+0.5) - S.cam3d.yaw));
+        const baseColor = w.color || '#3b3a38';
+        faces.push({depth, draw(){
+          c.beginPath(); c.moveTo(pts[0].x,pts[0].y);
+          for(let k=1;k<4;k++) c.lineTo(pts[k].x,pts[k].y);
+          c.closePath();
+          c.fillStyle = shadeColor3d(baseColor, shade); c.fill();
+          c.strokeStyle = 'rgba(40,35,25,.6)'; c.lineWidth = 0.8; c.stroke();
+        }});
+      }
+      // top face
+      {
+        const pts=top; const depth = pts.reduce((s,p)=>s+p.depth,0)/4 + 50;
+        faces.push({depth, draw(){
+          c.beginPath(); c.moveTo(pts[0].x,pts[0].y);
+          for(let k=1;k<4;k++) c.lineTo(pts[k].x,pts[k].y);
+          c.closePath(); c.fillStyle = shadeColor3d(w.color||'#3b3a38', 1.05); c.fill();
+          c.strokeStyle='rgba(40,35,25,.6)'; c.lineWidth=0.8; c.stroke();
+        }});
+      }
+      // OPENINGS on this wall — cut a hole by drawing a patch (paper color) + frame
+      const wallOpenings = S.openings.filter(o => o.wallId === w.id);
+      for (const o of wallOpenings) {
+        const wsize = o.width || 80;
+        const halfT = t/2;
+        const halfW = wsize/2;
+        const tParam = clamp(o.t, 0.05, 0.95);
+        const cxw = w.a.x + (w.b.x - w.a.x) * tParam;
+        const cyw = w.a.y + (w.b.y - w.a.y) * tParam;
+        // opening rectangle on wall surface (front face facing +normal)
+        const p1 = { x: cxw + Math.cos(ang)*halfW + nx, y: cyw + Math.sin(ang)*halfW + ny };
+        const p2 = { x: cxw - Math.cos(ang)*halfW + nx, y: cyw - Math.sin(ang)*halfW + ny };
+        const p3 = { x: cxw - Math.cos(ang)*halfW - nx, y: cyw - Math.sin(ang)*halfW - ny };
+        const p4 = { x: cxw + Math.cos(ang)*halfW - nx, y: cyw + Math.sin(ang)*halfW - ny };
+        if (o.kind === 'door') {
+          // door opening: from floor to ~210cm
+          const dH = 210;
+          const db=p1,dc=p2,dd=p3,da=p4;
+          const aT=project3D(da.x,da.y,dH),bT=project3D(db.x,db.y,dH),cT=project3D(dc.x,dc.y,dH),dT=project3D(dd.x,dd.y,dH);
+          const aB=project3D(da.x,da.y,0),bB=project3D(db.x,db.y,0),cB=project3D(dc.x,dc.y,0),dB=project3D(dd.x,dd.y,0);
+          const depth=(aB.depth+bB.depth+cB.depth+dB.depth)/4 + 5;
+          // draw opening as "hole" (sky color) + frame
+          faces.push({depth, draw(){
+            // hole
+            c.beginPath();c.moveTo(aB.x,aB.y);c.lineTo(bB.x,bB.y);c.lineTo(bT.x,bT.y);c.lineTo(aT.x,aT.y);c.closePath();
+            c.fillStyle='#2a2520'; c.fill();
+            // door leaf
+            const hinge = o.flip ? dc : db;
+            const leafEnd = o.flip
+              ? { x: dc.x + Math.cos(ang+Math.PI/2)*wsize*0.9 - Math.cos(ang)*halfT, y: dc.y + Math.sin(ang+Math.PI/2)*wsize*0.9 - Math.sin(ang)*halfT }
+              : { x: db.x + Math.cos(ang+Math.PI/2)*wsize*0.9 + Math.cos(ang)*halfT, y: db.y + Math.sin(ang+Math.PI/2)*wsize*0.9 + Math.sin(ang)*halfT };
+            const hP=project3D(hinge.x,hinge.y,0), lP=project3D(leafEnd.x,leafEnd.y,0);
+            c.fillStyle='#8b5a2b'; c.beginPath(); c.moveTo(hP.x,hP.y); c.lineTo(lP.x,lP.y); c.lineTo(lP.x, lP.y - dH*pxPerCm()*0.5*S.cam3d.dist); c.lineTo(hP.x, hP.y - dH*pxPerCm()*0.5*S.cam3d.dist); c.closePath(); c.fill();
+            c.strokeStyle='#5a3a1a'; c.lineWidth=1; c.stroke();
+            // frame
+            c.strokeStyle='#1a1510'; c.lineWidth=2;
+            c.beginPath();c.moveTo(aB.x,aB.y);c.lineTo(bB.x,bB.y);c.lineTo(bT.x,bT.y);c.lineTo(aT.x,aT.y);c.closePath();c.stroke();
+          }});
+        } else { // window
+          const wH1=90, wH2=210;
+          const aT=project3D(p4.x,p4.y,wH2),bT=project3D(p1.x,p1.y,wH2),cT=project3D(p2.x,p2.y,wH2),dT=project3D(p3.x,p3.y,wH2);
+          const aB=project3D(p4.x,p4.y,wH1),bB=project3D(p1.x,p1.y,wH1),cB=project3D(p2.x,p2.y,wH1),dB=project3D(p3.x,p3.y,wH1);
+          const depth=(aB.depth+bB.depth+cB.depth+dB.depth)/4 + 5;
+          faces.push({depth, draw(){
+            c.beginPath();c.moveTo(aB.x,aB.y);c.lineTo(bB.x,bB.y);c.lineTo(bT.x,bT.y);c.lineTo(aT.x,aT.y);c.closePath();
+            c.fillStyle='#a8d4f0'; c.fill();
+            c.strokeStyle='#5a7a8a'; c.lineWidth=1.5; c.stroke();
+            // mullion
+            const m1=project3D((p4.x+p1.x)/2,(p4.y+p1.y)/2,wH1),m2=project3D((p4.x+p1.x)/2,(p4.y+p1.y)/2,wH2);
+            c.beginPath();c.moveTo(m1.x,m1.y);c.lineTo(m2.x,m2.y);c.stroke();
+          }});
+        }
+      }
     }
   }
-  // furniture as simple extruded boxes
+
+  // FURNITURE as extruded boxes (correct 3D placement)
   if (S.layers.furniture) {
     for (const f of S.furniture) {
       const item = window.FURNITURE.items.find(i => i.id === f.itemId); if (!item) continue;
-      const [cx, cy] = proj(f.x, f.y, 0);
-      const bw = f.w * sc * 0.5, bh = f.h * sc * 0.5;
-      const fh = (item.h3d || 45) * sc;
-      c.save(); c.translate(cx, cy); c.rotate((f.rot || 0) * Math.PI / 180);
-      // box
-      c.fillStyle = (f.color || '#9a8f73') + 'cc';
-      c.fillRect(-bw, -bh - fh, bw * 2, fh);
-      c.fillStyle = (f.color || '#9a8f73');
-      c.fillRect(-bw, -bh, bw * 2, bh);
-      c.strokeStyle = '#5a4a2a'; c.lineWidth = 1; c.strokeRect(-bw, -bh, bw * 2, bh);
-      c.strokeRect(-bw, -bh - fh, bw * 2, fh);
-      c.beginPath(); c.moveTo(-bw, -bh); c.lineTo(-bw, -bh - fh); c.moveTo(bw, -bh); c.lineTo(bw, -bh - fh); c.stroke();
-      c.restore();
+      const fh = item.h3d || 45;
+      // local box corners (centered on f.x,f.y), rotated by f.rot
+      const rot = (f.rot||0) * Math.PI / 180;
+      const hw = f.w/2, hh = f.h/2;
+      const local = [ {x:-hw,y:-hh},{x:hw,y:-hh},{x:hw,y:hh},{x:-hw,y:hh} ];
+      const world = local.map(p => ({
+        x: f.x + p.x*Math.cos(rot) - p.y*Math.sin(rot),
+        y: f.y + p.x*Math.sin(rot) + p.y*Math.cos(rot),
+      }));
+      const btm = world.map(p => project3D(p.x, p.y, 0));
+      const top = world.map(p => project3D(p.x, p.y, fh));
+      const baseColor = f.color || '#8a7a5a';
+      // 4 side faces
+      for (let i=0;i<4;i++) {
+        const j=(i+1)%4;
+        const pts=[btm[i],btm[j],top[j],top[i]];
+        const depth=(btm[i].depth+btm[j].depth+top[j].depth+top[i].depth)/4;
+        const shade = 0.65 + 0.35 * (0.5 + 0.5*Math.cos(rot + Math.PI/2*(i+0.5) - S.cam3d.yaw));
+        faces.push({depth, draw(){
+          c.beginPath();c.moveTo(pts[0].x,pts[0].y);
+          for(let k=1;k<4;k++) c.lineTo(pts[k].x,pts[k].y);
+          c.closePath(); c.fillStyle=shadeColor3d(baseColor, shade); c.fill();
+          c.strokeStyle='rgba(40,30,15,.6)'; c.lineWidth=0.7; c.stroke();
+        }});
+      }
+      // top face
+      {
+        const pts=top; const depth=pts.reduce((s,p)=>s+p.depth,0)/4 + 30;
+        faces.push({depth, draw(){
+          c.beginPath();c.moveTo(pts[0].x,pts[0].y);
+          for(let k=1;k<4;k++) c.lineTo(pts[k].x,pts[k].y);
+          c.closePath(); c.fillStyle=shadeColor3d(baseColor, 1.1); c.fill();
+          c.strokeStyle='rgba(40,30,15,.6)'; c.lineWidth=0.7; c.stroke();
+          // label on top
+          if (f.label) {
+            const cx=pts.reduce((s,p)=>s+p.x,0)/4, cy=pts.reduce((s,p)=>s+p.y,0)/4;
+            c.fillStyle='#3a2a15'; c.font='600 11px Inter'; c.textAlign='center'; c.textBaseline='middle';
+            c.fillText(f.label, cx, cy);
+          }
+        }});
+      }
     }
   }
-  // 3D badge
-  c.fillStyle = 'rgba(245,158,11,.95)'; c.font = '700 12px Inter';
-  c.textAlign = 'right'; c.textBaseline = 'top';
-  c.fillText('3D ИЗОМЕТРИЯ · потолок ' + S.ceilingHeight + ' см', S.W - 16, 16);
+
+  // SYMBOLS (outlets, lights) as small markers floating at their 3D position
+  if (S.layers.symbols) {
+    for (const s of S.symbols) {
+      const z = s.kind === 'light' ? (wallH - 20) : 30;
+      const p = project3D(s.x, s.y, z);
+      faces.push({depth: p.depth + 1, draw(){
+        if (s.kind === 'light') {
+          c.fillStyle='rgba(255,230,120,.9)'; c.beginPath(); c.arc(p.x,p.y,7,0,Math.PI*2); c.fill();
+          c.strokeStyle='#ca8a04'; c.lineWidth=1.5; c.stroke();
+          // glow
+          const g=c.createRadialGradient(p.x,p.y,2,p.x,p.y,18);
+          g.addColorStop(0,'rgba(255,230,120,.4)'); g.addColorStop(1,'rgba(255,230,120,0)');
+          c.fillStyle=g; c.beginPath(); c.arc(p.x,p.y,18,0,Math.PI*2); c.fill();
+        } else if (s.kind === 'outlet') {
+          c.fillStyle='#7c3aed'; c.beginPath(); c.arc(p.x,p.y,4,0,Math.PI*2); c.fill();
+          c.strokeStyle='#fff'; c.lineWidth=1; c.stroke();
+        } else {
+          c.fillStyle='#fef08a'; c.strokeStyle='#ca8a04'; c.lineWidth=1;
+          c.beginPath(); c.rect(p.x-12,p.y-8,24,16); c.fill(); c.stroke();
+          c.fillStyle='#713f12'; c.font='600 9px Inter'; c.textAlign='center'; c.textBaseline='middle';
+          c.fillText((s.text||'Заметка').slice(0,10), p.x, p.y);
+        }
+      }});
+    }
+  }
+
+  // sort by depth (far first, near last) and draw
+  faces.sort((a,b) => b.depth - a.depth);
+  for (const f of faces) f.draw();
+
+  // HUD overlay
+  c.fillStyle='rgba(20,24,30,.85)';
+  c.fillRect(S.W-260, 12, 248, 56);
+  c.strokeStyle='rgba(245,158,11,.4)'; c.lineWidth=1; c.strokeRect(S.W-260, 12, 248, 56);
+  c.fillStyle='#f59e0b'; c.font='700 12px Inter'; c.textAlign='left'; c.textBaseline='top';
+  c.fillText('3D ПРОСМОТР', S.W-250, 20);
+  c.fillStyle='#9aa3b2'; c.font='500 10.5px Inter';
+  c.fillText('Перетаскивание — вращать · колесо — зум', S.W-250, 38);
+  c.fillText(`Потолок: ${wallH} см · Yaw: ${Math.round(S.cam3d.yaw*180/Math.PI)}° Pitch: ${Math.round(S.cam3d.pitch*180/Math.PI)}°`, S.W-250, 52);
+}
+
+// helpers for 3D shading
+function shadeColor3d(hex, factor) {
+  // accept #rrggbb; factor>1 lighten, <1 darken
+  if (!hex || hex[0] !== '#') hex = '#8a7a5a';
+  let r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  r=clamp(Math.round(r*factor),0,255); g=clamp(Math.round(g*factor),0,255); b=clamp(Math.round(b*factor),0,255);
+  return `rgb(${r},${g},${b})`;
+}
+function solidifyColor(rgba, factor) {
+  // turn rgba(r,g,b,a) into solid rgb scaled by factor
+  const m = rgba.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!m) return '#c9b896';
+  return shadeColor3d('#'+[m[1],m[2],m[3]].map(n=>(+n).toString(16).padStart(2,'0')).join(''), factor);
 }
 
 function drawGrid() {
@@ -846,6 +1043,13 @@ function onPointerDown(e) {
   const [wx, wy] = s2w(sx, sy);
   S.mouse.wx = wx; S.mouse.wy = wy;
 
+  // ===== 3D mode: drag rotates camera, no editing =====
+  if (S.viewMode === '3d') {
+    S.drag3d = { sx, sy, yaw: S.cam3d.yaw, pitch: S.cam3d.pitch, cx: S.cam3d.cx, cy: S.cam3d.cy, panning: e.button === 2 || e.shiftKey };
+    $('.canvas-area').classList.add('panning');
+    return;
+  }
+
   // pan with space or middle button or pan tool
   if (S.spacePan || e.button === 1 || S.tool === 'pan') {
     S.dragStart = { mode: 'pan', sx, sy, panX: S.pan.x, panY: S.pan.y };
@@ -1003,6 +1207,24 @@ function onPointerMove(e) {
   const [wx, wy] = s2w(sx, sy);
   S.mouse.wx = wx; S.mouse.wy = wy;
 
+  // ===== 3D mode: rotate camera =====
+  if (S.drag3d) {
+    const dx = sx - S.drag3d.sx;
+    const dy = sy - S.drag3d.sy;
+    if (S.drag3d.panning) {
+      // pan camera target in world space (move perpendicular to view)
+      const sc = cmPerPx() / S.cam3d.dist;
+      const cy = Math.cos(S.drag3d.yaw), sy_ = Math.sin(S.drag3d.yaw);
+      S.cam3d.cx = S.drag3d.cx - (dx * cy + dy * sy_) * sc * 0.5;
+      S.cam3d.cy = S.drag3d.cy - (-dx * sy_ + dy * cy) * sc * 0.5;
+    } else {
+      S.cam3d.yaw = S.drag3d.yaw + dx * 0.01;
+      S.cam3d.pitch = clamp(S.drag3d.pitch + dy * 0.008, 0.05, Math.PI / 2 - 0.05);
+    }
+    render();
+    return;
+  }
+
   if (S.dragStart) {
     if (S.dragStart.mode === 'pan') {
       const dx = (sx - S.dragStart.sx) * cmPerPx();
@@ -1065,6 +1287,11 @@ function onPointerMove(e) {
 
 function onPointerUp(e) {
   S.mouse.down = false;
+  if (S.drag3d) {
+    S.drag3d = null;
+    $('.canvas-area').classList.remove('panning');
+    return;
+  }
   if (S.dragStart) {
     if (S.dragStart.mode === 'pan') { $('.canvas-area').classList.remove('panning'); }
     if (S.dragStart.mode === 'move' || S.dragStart.mode === 'rotate' || S.dragStart.mode === 'endpoint' || S.dragStart.mode === 'roompoint') {
@@ -1080,6 +1307,13 @@ function onPointerUp(e) {
 
 function onWheel(e) {
   e.preventDefault();
+  // ===== 3D mode: zoom camera distance =====
+  if (S.viewMode === '3d') {
+    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    S.cam3d.dist = clamp(S.cam3d.dist * factor, 0.15, 6);
+    render();
+    return;
+  }
   const { sx, sy } = getPointer(e);
   const [wxBefore, wyBefore] = s2w(sx, sy);
   const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
@@ -1175,6 +1409,26 @@ function bindTopbar() {
   // calculator + templates
   $('#btnCalc').addEventListener('click', openCalculator);
   $('#btnTemplates').addEventListener('click', openTemplates);
+  // 3D camera presets
+  $('#btnCamReset').addEventListener('click', () => setCamPreset('iso'));
+  $('#btnCamFront').addEventListener('click', () => setCamPreset('front'));
+  $('#btnCamSide').addEventListener('click', () => setCamPreset('side'));
+  $('#btnCamTop').addEventListener('click', () => setCamPreset('top'));
+  $('#btnCamIso').addEventListener('click', () => setCamPreset('iso'));
+}
+
+function setCamPreset(name) {
+  if (name === 'iso') { S.cam3d.yaw = -Math.PI / 4; S.cam3d.pitch = Math.PI / 6; }
+  else if (name === 'front') { S.cam3d.yaw = 0; S.cam3d.pitch = 0.05; }
+  else if (name === 'side') { S.cam3d.yaw = Math.PI / 2; S.cam3d.pitch = 0.05; }
+  else if (name === 'top') { S.cam3d.yaw = -Math.PI / 4; S.cam3d.pitch = Math.PI / 2 - 0.05; }
+  // mark active preset button
+  ['btnCamReset','btnCamFront','btnCamSide','btnCamTop','btnCamIso'].forEach(id => $('#' + id).classList.remove('active'));
+  if (name === 'iso') $('#btnCamIso').classList.add('active');
+  else if (name === 'front') $('#btnCamFront').classList.add('active');
+  else if (name === 'side') $('#btnCamSide').classList.add('active');
+  else if (name === 'top') $('#btnCamTop').classList.add('active');
+  render();
 }
 
 function setView(mode) {
@@ -1182,8 +1436,34 @@ function setView(mode) {
   $('#btnView2D').classList.toggle('active', mode === '2d');
   $('#btnView3D').classList.toggle('active', mode === '3d');
   $('.canvas-area').classList.toggle('view-3d', mode === '3d');
+  // show/hide camera controls
+  $('#camControls').style.display = mode === '3d' ? 'flex' : 'none';
+  // disable left toolbar tools in 3D (visual feedback)
+  $$('.tool-btn[data-tool]').forEach(b => { b.style.opacity = mode === '3d' ? '0.4' : ''; b.style.pointerEvents = mode === '3d' ? 'none' : ''; });
+  if (mode === '3d') {
+    // re-center camera on scene bbox
+    S._camInited = false;
+    // auto-fit camera distance based on scene size
+    if (S.walls.length || S.furniture.length || S.rooms.length) {
+      let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+      const ex=(x,y)=>{minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);};
+      S.walls.forEach(w=>{ex(w.a.x,w.a.y);ex(w.b.x,w.b.y);});
+      S.furniture.forEach(f=>ex(f.x,f.y));
+      S.rooms.forEach(r=>r.points.forEach(p=>ex(p.x,p.y)));
+      if (isFinite(minX)) {
+        const wcm = maxX - minX, hcm = maxY - minY;
+        // account for wall height in projection too
+        const diagCm = Math.sqrt(wcm*wcm + hcm*hcm + (S.ceilingHeight||270)*(S.ceilingHeight||270));
+        const vpMin = Math.min(S.W, S.H);
+        // we want: diagCm * pxPerCm() * 0.5 * dist ≈ vpMin * 0.7
+        S.cam3d.dist = clamp((vpMin * 0.7) / (diagCm * pxPerCm() * 0.5), 0.2, 8);
+      }
+    } else {
+      S.cam3d.dist = 1;
+    }
+  }
   render();
-  toast(mode === '3d' ? '3D изометрический вид' : '2D вид', 'success');
+  toast(mode === '3d' ? '3D вид — тяните мышью для вращения, колесо — зум' : '2D вид', 'success');
 }
 function updateZoomLabel() {
   $('#zoomLabel').textContent = Math.round(S.zoom * 100) + '%';
@@ -1274,6 +1554,7 @@ function renderFurnitureGrid(filter, cat = '__all') {
 }
 
 function startFurniturePlace(item) {
+  if (S.viewMode === '3d') { toast('Перейдите в 2D для размещения мебели', 'error'); return; }
   // enter placement mode without switching tool — keeps furniturePreview alive
   S.furniturePreview = { item, x: S.mouse.wx, y: S.mouse.wy };
   S.canvas.style.cursor = 'copy';
@@ -1530,7 +1811,9 @@ function bindKeyboard() {
     if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
     if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); }
     if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); savePlan(); }
-    if (e.key === 'Delete' || e.key === 'Backspace') { if (S.selection) { deleteObj(S.selection); } }
+    if (e.key === 'Delete' || e.key === 'Backspace') { if (S.selection && S.viewMode === '2d') { deleteObj(S.selection); } }
+    // block tool switching in 3D mode
+    if (S.viewMode === '3d') return;
     const map = { v: 'select', w: 'wall', d: 'door', n: 'window', r: 'room', t: 'text', m: 'measure', e: 'eraser', h: 'pan', s: 'split', o: 'outlet', l: 'light' };
     if (map[e.key.toLowerCase()] && !e.ctrlKey && !e.metaKey) setTool(map[e.key.toLowerCase()]);
     if (e.key === '[') { S.furniture.forEach(f => { if (S.selection && S.selection.id === f.id) f.rot = (f.rot||0) - 5; }); render(); refreshPanel(true); }
@@ -1684,6 +1967,26 @@ function makeThumbnail() {
  * EXPORT
  * ============================================================ */
 function exportPng() {
+  // ===== 3D mode: just snapshot the current canvas (includes camera angle) =====
+  if (S.viewMode === '3d') {
+    // high-res re-render at 2x
+    const tmp = document.createElement('canvas');
+    tmp.width = S.W * 2; tmp.height = S.H * 2;
+    const tc = tmp.getContext('2d');
+    tc.scale(2, 2);
+    // temporarily swap ctx to render into tmp
+    const origCtx = S.ctx, origW = S.W, origH = S.H;
+    S.ctx = tc; S.W = S.W; S.H = S.H;
+    draw3D();
+    S.ctx = origCtx; S.W = origW; S.H = origH;
+    const link = document.createElement('a');
+    link.download = (S.planName || 'plan') + '_3D.png';
+    link.href = tmp.toDataURL('image/png');
+    link.click();
+    toast('3D сцена экспортирована в PNG', 'success');
+    render(); // restore on-screen canvas
+    return;
+  }
   // re-render at high res into temp canvas covering bbox
   let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
   const ex = (x,y) => { minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y); };
@@ -2121,6 +2424,10 @@ function toast(msg, type) {
 /* ============================================================
  * BOOT
  * ============================================================ */
-window.addEventListener('DOMContentLoaded', init);
+window.addEventListener('DOMContentLoaded', () => {
+  init();
+  // expose state for debugging / external control
+  window.__fp = { S, render, project3D, setView, setCamPreset };
+});
 
 })();
