@@ -34,24 +34,10 @@ PORT = app.config["PORT"]
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 3600  # Cache static files for 1 hour
 
 # Ensure proper MIME type for JS files
-import mimetypes
-mimetypes.add_type('application/javascript', '.js')
-mimetypes.add_type('text/css', '.css')
-mimetypes.add_type('image/svg+xml', '.svg')
-
-# Override static file serving to ensure correct MIME types
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    """Serve static files with correct MIME types."""
-    response = send_from_directory(app.static_folder, filename)
-    # Force correct MIME type for JS files
-    if filename.endswith('.js'):
-        response.headers['Content-Type'] = 'application/javascript; charset=utf-8'
-    elif filename.endswith('.css'):
-        response.headers['Content-Type'] = 'text/css; charset=utf-8'
-    elif filename.endswith('.svg'):
-        response.headers['Content-Type'] = 'image/svg+xml; charset=utf-8'
-    return response
+if not app.extensions.get('mime_types'):
+    import mimetypes
+    mimetypes.add_type('application/javascript', '.js')
+    mimetypes.add_type('text/css', '.css')
 
 # Security constants
 MAX_NAME_LENGTH = 200
