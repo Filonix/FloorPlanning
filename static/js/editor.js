@@ -14,6 +14,66 @@ const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
 const uid = () => Math.random().toString(36).slice(2, 10);
 const now = () => Date.now();
 
+/* ---------- Autosave / LocalStorage ---------- */
+const AUTOSAVE_KEY = 'floorplanner_autosave';
+const AUTOSAVE_INTERVAL = 5000; // 5 seconds
+let autosaveTimer = null;
+
+function saveToLocalStorage() {
+  try {
+    const data = snapshot();
+    data.planId = S.planId;
+    data.planName = S.planName;
+    data.savedAt = now();
+    localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(data));
+    console.log('[Autosave] Saved to localStorage');
+  } catch (e) {
+    console.warn('[Autosave] Failed to save:', e);
+  }
+}
+
+function loadFromLocalStorage() {
+  try {
+    const saved = localStorage.getItem(AUTOSAVE_KEY);
+    if (!saved) return false;
+    const data = JSON.parse(saved);
+    // Check if autosave is recent (within 24 hours)
+    if (data.savedAt && now() - data.savedAt > 24 * 60 * 60 * 1000) {
+      console.log('[Autosave] Too old, skipping');
+      return false;
+    }
+    if (data.planId) S.planId = data.planId;
+    if (data.planName) S.planName = data.planName;
+    restore(data);
+    S.history = []; S.histIdx = -1; pushHistory();
+    $('#planName').value = S.planName;
+    console.log('[Autosave] Loaded from localStorage');
+    return true;
+  } catch (e) {
+    console.warn('[Autosave] Failed to load:', e);
+    return false;
+  }
+}
+
+function clearAutosave() {
+  try {
+    localStorage.removeItem(AUTOSAVE_KEY);
+    console.log('[Autosave] Cleared');
+  } catch (e) {
+    console.warn('[Autosave] Failed to clear:', e);
+  }
+}
+
+function scheduleAutosave() {
+  if (autosaveTimer) clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => {
+    if (S.dirty) {
+      saveToLocalStorage();
+    }
+    scheduleAutosave();
+  }, AUTOSAVE_INTERVAL);
+}
+
 /* ---------- State ---------- */
 const S = {
   canvas: null, ctx: null,
@@ -190,6 +250,12 @@ function init() {
   resize();
   window.addEventListener('resize', resize);
 
+  // Try to load autosave first
+  const hasAutosave = loadFromLocalStorage();
+  if (hasAutosave) {
+    toast('Восстановлено автосохранение', 'success');
+  }
+
   // center origin initially
   S.pan = { x: 0, y: 0 };
 
@@ -205,6 +271,10 @@ function init() {
   pushHistory();
   render();
   refreshPanel();
+  
+  // Start autosave timer
+  scheduleAutosave();
+  
   toast('Готово к работе. Инструмент: Выбрать', 'success');
 }
 
@@ -1923,9 +1993,20 @@ async function savePlan() {
       body: JSON.stringify(data)
     });
     const res = await r.json();
-    S.dirty = false; $('#saveStatus').textContent = 'сохранено'; $('#saveStatus').classList.add('saved');
-    toast('Проект сохранён', 'success');
-  } catch (e) { toast('Ошибка сохранения', 'error'); }
+    if (res.ok && res.id) {
+      S.dirty = false; 
+      $('#saveStatus').textContent = 'сохранено'; 
+      $('#saveStatus').classList.add('saved');
+      toast('Проект сохранён', 'success');
+      // Clear autosave after successful server save
+      clearAutosave();
+    } else {
+      throw new Error(res.error || 'Unknown error');
+    }
+  } catch (e) { 
+    console.error('Save error:', e);
+    toast('Ошибка сохранения: ' + e.message, 'error'); 
+  }
 }
 
 function newPlan() {
@@ -1935,6 +2016,8 @@ function newPlan() {
   S.pan = { x: 0, y: 0 }; S.zoom = 1; updateZoomLabel();
   S.history = []; S.histIdx = -1; pushHistory();
   $('#modalLibrary').hidden = true;
+  // Clear autosave when starting new plan
+  clearAutosave();
   render(); refreshPanel();
   toast('Новый проект', 'success');
 }
