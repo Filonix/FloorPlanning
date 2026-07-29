@@ -30,15 +30,6 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB max JSON size
 app.config["PORT"] = int(os.environ.get("PORT", 5050))
 PORT = app.config["PORT"]
 
-# Add proper MIME types for static files
-app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 3600  # Cache static files for 1 hour
-
-# Ensure proper MIME type for JS files
-if not app.extensions.get('mime_types'):
-    import mimetypes
-    mimetypes.add_type('application/javascript', '.js')
-    mimetypes.add_type('text/css', '.css')
-
 # Security constants
 MAX_NAME_LENGTH = 200
 MAX_ID_LENGTH = 50
